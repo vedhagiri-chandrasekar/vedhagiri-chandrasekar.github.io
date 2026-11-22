@@ -86,7 +86,8 @@
       Drag to orbit · scroll to zoom · drag a knob or type a value.<br>
       Keys: <kbd>Q</kbd>/<kbd>A</kbd> base · <kbd>W</kbd>/<kbd>S</kbd> Height_2 · <kbd>E</kbd>/<kbd>D</kbd> Height_1 ·
       <kbd>R</kbd>/<kbd>F</kbd> grip rotate · <kbd>Space</kbd> grip<br>
-      Task: pick the apples and drop them into the bin on the rover, or press <b>Auto harvest</b>.<br>Ground pick: Height_2 ≈ 38 · Height_1 ≈ 70. Over the bin: Base 30 · Height_2 335 · Height_1 112.
+      Task: pick the apples and drop them into the bin on the rover, or press <b>Auto harvest</b>.<br>
+      Unload: arm forward (Base 197), close the gripper, then push it into the ground in front &mdash; e.g. Height_1 39 · Height_2 94. The body tips back and the apples roll out. Or press <b>Unload</b>.
     </div>
   </div>
 
@@ -129,6 +130,7 @@
       </label>
       <div class="btnrow">
         <button class="plain" id="autoBtn" style="background:#1f6b38;border-color:#2fd158">&#9654; Auto harvest</button>
+        <button class="plain" id="dumpBtn" style="background:#7a5a12;border-color:#f5b301">&#8681; Unload</button>
         <button class="plain" id="homeBtn">Home pose</button>
         <button class="plain" id="resetBtn">Reset apples</button>
         <button class="plain" id="camBtn">Reset camera</button>
@@ -324,6 +326,10 @@ const W = new THREE.Group();
 W.scale.setScalar(0.001);
 W.position.set(-GEO.PB[0]*0.001, -1.9*0.001, -GEO.PB[2]*0.001);
 scene.add(W);
+const W0 = W.position.clone();
+/* GW: the same millimetre frame as W, but it never tilts. Apples lying on the
+   ground live here, apples on the rover live in W. */
+const GW = new THREE.Group(); GW.scale.setScalar(0.001); GW.position.copy(W0); scene.add(GW);
 
 function partGeometry(name){
   const bin = atob(MESH[name]); const n = bin.length/2;
@@ -372,6 +378,40 @@ const gripPoint = new THREE.Object3D();
 gripPoint.position.set(GEO.GP[0]-GEO.PR[0], GEO.GP[1]-GEO.PR[1], GEO.GP[2]-GEO.PR[2]);
 jRo.add(gripPoint);
 
+/* ----------------------- Body tilt (unloading) ---------------------
+   If the fingertips are pushed into the ground in front of the front axle,
+   the rover pivots about its rear axle (x 672.4, y 50.9 mm, measured from the
+   wheel geometry) so the fingertips stay on the ground: the front lifts and
+   the bin at the back tips down. Max 35 deg (rear bumper touches at ~38). */
+const AXLE = {x:672.4, y:50.9}, FRONT_AXLE_X = 330, TILT_MAX = 35, TILT_ROLL = 14;
+const PIVOT = new THREE.Vector3(W0.x + AXLE.x*0.001, W0.y + AXLE.y*0.001, 0);
+let tilt = 0;
+const ZAX = new THREE.Vector3(0,0,1), qT = new THREE.Quaternion(), tv = new THREE.Vector3(), tv2 = new THREE.Vector3();
+function setTilt(deg){
+  qT.setFromAxisAngle(ZAX, -deg*D2R);
+  tv.copy(W0).sub(PIVOT).applyQuaternion(qT).add(PIVOT);
+  W.position.copy(tv); W.quaternion.copy(qT);
+}
+const tips = [[jC1, [23.61, 270.42, 208.87], GEO.PC1], [jC2, [38.06, 304.47, 2.16], GEO.PC2]].map(([j,t,p])=>{
+  const o = new THREE.Object3D(); o.position.set(t[0]-p[0], t[1]-p[1], t[2]-p[2]); j.add(o); return o;
+});
+function frontTipMinY(deg){
+  setTilt(deg); W.updateMatrixWorld(true);
+  let m = Infinity;
+  for(const t of tips){
+    t.getWorldPosition(tv2); tv.copy(tv2); W.worldToLocal(tv);
+    if(tv.x < FRONT_AXLE_X && Math.abs(tv.z-GEO.PB[2]) < 320) m = Math.min(m, tv2.y);
+  }
+  return m;
+}
+function solveTilt(){   // smallest tilt that keeps the front fingertips on/above the ground
+  if(frontTipMinY(0) >= 0) return 0;
+  if(frontTipMinY(TILT_MAX) < 0) return TILT_MAX;
+  let lo = 0, hi = TILT_MAX;
+  for(let i=0;i<18;i++){ const mid=(lo+hi)/2; if(frontTipMinY(mid) >= 0) hi = mid; else lo = mid; }
+  return hi;
+}
+
 /* Joint direction signs (the Simscape joint frames are in the missing data file):
    +Base turns about +Y, +H1 leans the arm forward, +H2 curls the gripper down,
    lower Grip values close the two fingers toward each other. */
@@ -416,14 +456,15 @@ function makeApple(i){
   return g;
 }
 const apples = PLAN.apples.map((a,i)=>{
-  const m = makeApple(i); W.add(m);
-  return {m, plan:a, home:new THREE.Vector3(a.x, GROUND+AR*.9, a.z), vel:0, falling:false, held:false, yaw:(i*2.399)%6.283};
+  const m = makeApple(i); GW.add(m);
+  return {m, home:new THREE.Vector3(a.x, GROUND+AR*.9, a.z), mode:"rest", vx:0, vy:0, vz:0, held:false, yaw:(i*2.399)%6.283};
 });
+const onRover = a => a.m.parent === W;
 let heldApple = null, inBasket = 0;
 function resetApples(){
   if(autoRun) stopAuto();
-  if(heldApple){ W.attach(heldApple.m); heldApple.held=false; heldApple=null; }
-  apples.forEach(a=>{ a.m.position.copy(a.home); a.m.rotation.set(0,a.yaw,0); a.vel=0; a.falling=false; });
+  if(heldApple){ heldApple.held=false; heldApple=null; }
+  apples.forEach(a=>{ GW.add(a.m); a.m.position.copy(a.home); a.m.rotation.set(0,a.yaw,0); a.mode="rest"; a.vx=a.vy=a.vz=0; });
   updateBasket(true);
 }
 document.getElementById("resetBtn").addEventListener("click",resetApples);
@@ -432,20 +473,22 @@ const contLamp = document.getElementById("contLamp"), contText = document.getEle
 const toast = document.getElementById("toast"), scoreEl = document.getElementById("score");
 function showToast(t){ toast.textContent=t; toast.classList.add("show"); clearTimeout(showToast.t); showToast.t=setTimeout(()=>toast.classList.remove("show"),1600); }
 function updateBasket(silent){
-  const n = apples.filter(a=>!a.held && !a.falling && inBinXZ(a.m.position.x,a.m.position.z) && a.m.position.y < BIN.rim+2*AR).length;
+  const n = apples.filter(a=>!a.held && a.mode==="rest" && onRover(a) && inBinXZ(a.m.position.x,a.m.position.z)).length;
   if(!silent && n>inBasket) showToast(n===apples.length ? "All apples harvested!" : `Apple in the basket! (${n}/${apples.length})`);
   inBasket = n;
   scoreEl.textContent = `Apples in basket: ${n} / ${apples.length}`;
 }
 function updateContainerIndicator(){
-  if(heldApple){ contLamp.className="lamp big on-y"; contText.textContent="HOLDING APPLE"; }
+  const dumping = apples.some(a=>a.mode==="roll"||a.mode==="fly");
+  if(dumping){ contLamp.className="lamp big on-y"; contText.textContent="UNLOADING"; }
+  else if(heldApple){ contLamp.className="lamp big on-y"; contText.textContent="HOLDING APPLE"; }
   else if(inBasket>0){ contLamp.className="lamp big on-g"; contText.textContent=`BASKET ${inBasket}/${apples.length}`; }
   else { contLamp.className="lamp big"; contText.textContent="container Indicator"; }
 }
 function landHeight(a){
-  const p = a.m.position; let y = floorAt(p.x,p.z) + AR*.9;
+  const p = a.m.position; let y = (onRover(a) ? floorAt(p.x,p.z) : GROUND) + AR*.9;
   for(const o of apples){
-    if(o===a || o.held || o.falling) continue;
+    if(o===a || o.held || o.mode!=="rest" || o.m.parent!==a.m.parent) continue;
     const d = Math.hypot(o.m.position.x-p.x, o.m.position.z-p.z);
     if(d < 2*AR*.95) y = Math.max(y, o.m.position.y + Math.sqrt((2*AR*.95)**2 - d*d));
   }
@@ -457,18 +500,27 @@ resetApples();
    Drives the same knob values a user would (set_param equivalents). */
 const autoBtn = document.getElementById("autoBtn");
 const TRAVEL = {H1:0, H2:70.5692};
+const REACH = {"r0": 120, "dr": 4, "rows": [[36.0, 97.25, 5.25, 120.25, -100.46], [36.0, 96.75, 6.0, 119.5, -100.55], [36.0, 96.0, 8.25, 117.25, -100.67], [35.5, 95.75, 8.25, 116.75, -100.79], [35.5, 95.25, 8.25, 116.25, -100.86], [35.5, 94.5, 8.25, 115.5, -100.97], [35.0, 94.25, 8.25, 115.0, -101.06], [35.5, 93.25, 8.25, 114.25, -101.13], [34.75, 93.25, 8.25, 113.5, -101.21], [34.75, 92.75, 8.0, 113.25, -101.27], [34.5, 92.25, 8.5, 112.25, -101.35], [35.0, 91.25, 8.0, 112.0, -101.4], [35.25, 90.25, 8.5, 111.0, -101.48], [35.5, 90.0, 8.75, 110.25, -101.48], [35.25, 89.5, 8.5, 109.75, -101.55], [35.5, 88.75, 8.75, 109.0, -101.59], [34.75, 88.75, 9.0, 108.0, -101.66], [35.5, 87.5, 9.0, 107.5, -101.7], [34.75, 87.5, 9.25, 106.75, -101.76], [34.75, 86.75, 9.75, 105.75, -101.81], [35.5, 85.5, 9.25, 105.5, -101.85], [34.5, 85.75, 10.25, 104.0, -101.9], [35.0, 84.75, 10.25, 103.5, -101.94], [35.75, 83.5, 10.5, 102.75, -101.97], [35.0, 83.5, 10.25, 102.25, -102.02], [36.0, 82.0, 11.25, 100.75, -102.05], [35.25, 82.0, 11.25, 100.25, -102.09], [36.0, 80.75, 11.5, 99.5, -102.12], [36.0, 80.0, 12.0, 98.5, -102.16], [36.25, 79.25, 12.25, 97.75, -102.19], [36.0, 78.75, 12.0, 97.25, -102.23], [36.75, 77.5, 12.5, 96.25, -102.25], [36.0, 77.5, 13.0, 95.25, -102.29], [37.25, 75.75, 13.5, 94.25, -102.31], [37.0, 75.25, 13.75, 93.5, -102.35], [37.5, 74.25, 14.25, 92.5, -102.37], [38.0, 73.25, 14.0, 92.0, -102.39], [37.75, 72.75, 14.5, 91.0, -102.42], [38.5, 71.5, 15.5, 89.5, -102.44], [38.75, 70.5, 15.75, 88.75, -102.47], [39.0, 69.75, 16.25, 87.75, -102.49], [39.5, 68.5, 16.5, 87.0, -102.51], [39.5, 68.0, 16.25, 86.5, -102.53], [39.75, 67.0, 17.25, 85.0, -102.56], [39.75, 66.5, 17.5, 84.25, -102.58], [40.75, 64.75, 18.5, 82.75, -102.6], [40.5, 64.5, 18.75, 82.0, -102.62], [40.75, 63.5, 19.25, 81.0, -102.64], [42.0, 61.75, 19.0, 80.5, -102.65], [41.75, 61.25, 19.75, 79.25, -102.67], [42.25, 60.25, 20.25, 78.25, -102.69], [42.75, 59.0, 21.25, 76.75, -102.71], [43.75, 57.5, 21.75, 75.75, -102.72], [44.0, 56.5, 22.5, 74.5, -102.74], [44.0, 55.75, 23.0, 73.25, -102.76], [44.5, 54.75, 23.0, 72.75, -102.77], [45.25, 53.25, 23.75, 71.5, -102.79], [46.5, 51.25, 24.5, 70.25, -102.8], [46.0, 51.25, 24.5, 69.5, -102.82], [47.5, 49.0, 25.75, 67.75, -102.83], [47.5, 48.25, 26.5, 66.5, -102.85], [48.75, 46.25, 27.0, 65.5, -102.86], [48.25, 46.25, 27.0, 64.75, -102.87], null, null, null, null, null, null, null, null]};
+function groundPose(a){       // joint angles to pick an apple lying anywhere on the ground
+  const p = a.m.position, dx = p.x-GEO.PB[0], dz = p.z-GEO.PB[2];
+  if(p.x>232-15 && p.x<770+15 && p.z>35.7-15 && p.z<355.7+15) return null;   // under the rover
+  const r = Math.hypot(dx,dz), row = REACH.rows[Math.round((r-REACH.r0)/REACH.dr)];
+  if(!row) return null;
+  const B = ((HOME.Base + Math.atan2(dx,dz)/D2R - row[4]) % 360 + 360) % 360;
+  return {B, pick:{H1:row[0], H2:row[1]}, hover:{H1:row[2], H2:row[3]}};
+}
 function buildSequence(){
   const seq = []; let k = 0;
-  const targets = apples.filter(a=>!a.held && a.m.position.distanceTo(a.home) < 3);
-  targets.sort((p,q)=>p.plan.pick.B-q.plan.pick.B);
-  for(const a of targets){
+  const targets = apples.filter(a=>!a.held && a.mode==="rest" && !onRover(a))
+    .map(a=>({a, q:groundPose(a)})).filter(t=>t.q);
+  targets.sort((p,q)=>p.q.B-q.q.B);
+  for(const {q} of targets){
     const bin = PLAN.bins[(inBasket + k++) % PLAN.bins.length].pose;
     seq.push({grip:false},
-      {pose:TRAVEL}, {pose:{Base:a.plan.hover.B}},
-      {pose:{H1:a.plan.hover.H1, H2:a.plan.hover.H2}},
-      {pose:{H1:a.plan.pick.H1, H2:a.plan.pick.H2}},
+      {pose:TRAVEL}, {pose:{Base:q.B}},
+      {pose:q.hover}, {pose:q.pick},
       {grip:true}, {wait:.25},
-      {pose:{H1:a.plan.hover.H1, H2:a.plan.hover.H2}},
+      {pose:q.hover},
       {pose:TRAVEL}, {pose:{Base:bin.B}},
       {pose:{H1:bin.H1, H2:bin.H2}},
       {grip:false}, {wait:.45},
@@ -477,20 +529,32 @@ function buildSequence(){
   seq.push({pose:{Base:HOME.Base}}, {pose:{H1:HOME.H1, H2:HOME.H2, gripRo:0}});
   return seq;
 }
-function startAuto(){
+/* Unload: arm forward, fingertips pushed into the ground until the body tips
+   past the rolling angle, hold, then lift so the rover settles again. */
+function unloadSequence(){
+  // (H1 94, H2 39 with the gripper closed tips the body ~25 deg; apples roll past 14 deg)
+  return [{grip:true}, {pose:TRAVEL}, {pose:{Base:HOME.Base, gripRo:0}},
+    {pose:{H1:60, H2:62}}, {pose:{H1:77, H2:61}}, {pose:{H1:94, H2:39}}, {wait:2.5},
+    {pose:{H1:60, H2:62}}, {pose:TRAVEL}, {grip:false}, {pose:{H1:HOME.H1, H2:HOME.H2}}];
+}
+function startAuto(kind){
   if(!machineOn) return;
-  const seq = buildSequence();
-  if(seq.length<=2){ showToast("No apples left on the ground — press Reset apples"); }
-  autoRun = {seq, i:-1, t:0};
-  autoBtn.innerHTML = "&#9632; Stop auto"; autoBtn.style.background="#8f2a1d"; autoBtn.style.borderColor="#ef4b3c";
+  const seq = kind==="unload" ? unloadSequence() : buildSequence();
+  if(kind!=="unload" && seq.length<=2){ showToast("No reachable apples on the ground"); }
+  autoRun = {seq, i:-1, t:0, kind};
+  const b = kind==="unload" ? dumpBtn : autoBtn;
+  b.innerHTML = "&#9632; Stop"; b.style.background="#8f2a1d"; b.style.borderColor="#ef4b3c";
   set("gripRo", 0, true);
   nextAutoStep();
 }
 function stopAuto(){
   autoRun = null;
   autoBtn.innerHTML = "&#9654; Auto harvest"; autoBtn.style.background="#1f6b38"; autoBtn.style.borderColor="#2fd158";
+  dumpBtn.innerHTML = "&#8681; Unload"; dumpBtn.style.background="#7a5a12"; dumpBtn.style.borderColor="#f5b301";
 }
-autoBtn.addEventListener("click",()=>autoRun ? stopAuto() : startAuto());
+const dumpBtn = document.getElementById("dumpBtn");
+autoBtn.addEventListener("click",()=>autoRun ? stopAuto() : startAuto("harvest"));
+dumpBtn.addEventListener("click",()=>autoRun ? stopAuto() : startAuto("unload"));
 function nextAutoStep(){
   const r = autoRun; r.i++; r.t = 0;
   if(r.i >= r.seq.length){ stopAuto(); return; }
@@ -574,34 +638,70 @@ function step(now){
     if(rev) actual[k] = ((actual[k]%360)+360)%360;
   }
   applyJoints();
+  // body tilt follows the arm pushing on the ground; falls back at most 40 deg/s
+  const want = solveTilt();
+  tilt = want >= tilt ? want : Math.max(want, tilt - 40*dt);
+  setTilt(tilt);
   scene.updateMatrixWorld();
   gripPoint.getWorldPosition(tmpW);           // metres
   tmpL.copy(tmpW); W.worldToLocal(tmpL);      // CAD mm
 
-  // grasp / release
+  // grasp / release (distances compared in the world frame, mm)
   const closed = actual.Grip1 < 35 && actual.Grip2 < 35;
   if(!heldApple && closed && gripPressed){
     let best=null, bd=34;
-    for(const a of apples){ if(a.held) continue; const d=tmpL.distanceTo(a.m.position); if(d<bd){bd=d;best=a;} }
-    if(best){ best.m.position.copy(tmpL); best.falling=false; best.vel=0; jRo.attach(best.m); best.held=true; heldApple=best; updateBasket(true); }
+    for(const a of apples){ if(a.held) continue; a.m.getWorldPosition(tv); const d=tv.distanceTo(tmpW)*1000; if(d<bd){bd=d;best=a;} }
+    if(best){
+      tv.copy(tmpW); best.m.parent.worldToLocal(tv); best.m.position.copy(tv);
+      jRo.attach(best.m); best.held=true; best.mode="held"; heldApple=best; updateBasket(true);
+    }
   } else if(heldApple && !gripPressed && actual.Grip1 > 40){
-    const a = heldApple; W.attach(a.m); a.held=false; heldApple=null; a.vel=0; a.falling=true;
-    // anything let go above the bin rolls into it rather than balancing on the rim
+    const a = heldApple; heldApple=null; a.held=false; a.vx=a.vy=a.vz=0; a.mode="fall";
+    W.attach(a.m);
     const p=a.m.position, m=AR*.85;
     if(inBinXZ(p.x,p.z,-AR*.6) && p.y > BIN.rim){ p.x=Math.min(BIN.x1-m,Math.max(BIN.x0+m,p.x)); p.z=Math.min(BIN.z1-m,Math.max(BIN.z0+m,p.z)); }
+    if(floorAt(p.x,p.z)===GROUND) GW.attach(a.m);    // let go over the ground
   }
-  let landed=false;
+
+  // apple physics (mm, s): rest / fall / roll (on the tilted rover) / fly / groundroll
+  const G = 9806.65, sinT = Math.sin(tilt*D2R), cosT = Math.cos(tilt*D2R);
+  let changed=false;
   for(const a of apples){
     if(a.held) continue;
-    const yRest = landHeight(a);
-    if(a.falling || a.m.position.y > yRest+0.5){
-      a.falling = true;
-      a.vel -= 9806.65*dt;                       // model gravity, mm/s^2
-      a.m.position.y += a.vel*dt;
-      if(a.m.position.y <= yRest){ a.m.position.y = yRest; a.vel=0; a.falling=false; a.m.rotation.x=0; a.m.rotation.z=0; landed=true; }
+    const p = a.m.position;
+    if(a.mode==="rest"){
+      if(onRover(a) && tilt > TILT_ROLL){ a.mode="roll"; a.vx=0; changed=true; }
+      else if(p.y > landHeight(a)+0.5){ a.mode="fall"; a.vy=0; }
+    }
+    if(a.mode==="fall"){
+      const yRest = landHeight(a);
+      a.vy -= G*dt; p.y += a.vy*dt;
+      if(p.y <= yRest){ p.y=yRest; a.vy=0; a.mode="rest"; a.m.rotation.x=0; a.m.rotation.z=0; changed=true; }
+    } else if(a.mode==="roll"){                       // rolling down the tilted deck, rear (+x) is downhill
+      if(tilt < TILT_ROLL*.6 && a.vx < 40){ a.mode="fall"; a.vy=0; continue; }
+      a.vx += G*sinT*(5/7)*dt; p.x += a.vx*dt;
+      a.m.rotation.z -= a.vx*dt/AR;
+      const yFloor = (inBinXZ(p.x,p.z) && p.x < BIN.x1-AR*.6 ? BIN.floor : DECK.y) + AR*.9;
+      p.y += (yFloor - p.y)*Math.min(1, 12*dt);
+      if(p.x > 770){                                    // off the rear edge
+        GW.attach(a.m);
+        a.vy = -a.vx*sinT; a.vx = a.vx*cosT; a.vz = (Math.random()-.5)*160; a.mode="fly"; changed=true;
+      }
+    } else if(a.mode==="fly"){
+      a.vy -= G*dt; p.x += a.vx*dt; p.y += a.vy*dt; p.z += a.vz*dt;
+      a.m.rotation.z -= a.vx*dt/AR;
+      if(p.y <= GROUND+AR*.9){ p.y = GROUND+AR*.9; a.vy = 0; a.mode="groundroll"; }
+    } else if(a.mode==="groundroll"){
+      const v = Math.hypot(a.vx,a.vz);
+      if(v < 15){ a.vx=a.vz=0; a.mode="rest"; changed=true; }
+      else {
+        const f = Math.max(0, v - 650*dt)/v; a.vx*=f; a.vz*=f;
+        p.x += a.vx*dt; p.z += a.vz*dt;
+        a.m.rotation.z -= a.vx*dt/AR; a.m.rotation.x += a.vz*dt/AR;
+      }
     }
   }
-  if(landed) updateBasket(false);
+  if(changed) updateBasket(false);
   autoTick(dt);
   updateContainerIndicator();
 
@@ -610,7 +710,8 @@ function step(now){
     `Base ${actual.Base.toFixed(1)} · H1 ${actual.H1.toFixed(1)} · H2 ${actual.H2.toFixed(1)}<br>`+
     `gripRo ${actual.gripRo.toFixed(1)} · Grip1/2 ${actual.Grip1.toFixed(0)}/${actual.Grip2.toFixed(0)}<br>`+
     `<b>Gripper position (mm, from turntable axis)</b><br>`+
-    `x ${(tmpW.x*1000).toFixed(0)} · y ${(tmpW.y*1000).toFixed(0)} · z ${(tmpW.z*1000).toFixed(0)}`;
+    `x ${(tmpW.x*1000).toFixed(0)} · y ${(tmpW.y*1000).toFixed(0)} · z ${(tmpW.z*1000).toFixed(0)}<br>`+
+    `<b>Body tilt</b> ${tilt.toFixed(1)}°${tilt>TILT_ROLL?" · apples roll":""}`;
 
   placeCam();
   renderer.render(scene,camera);
